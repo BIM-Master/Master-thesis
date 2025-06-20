@@ -1,225 +1,398 @@
-import pandas as pd
-from datetime import datetime
-from dotenv import load_dotenv
 import os
-import requests  # Use requests for HTTP calls
-from prompt_generator import generate_prompts
-from tenacity import retry, stop_after_attempt, wait_exponential
-from tqdm import tqdm
-import time
-import random
-import json
+import pandas as pd
+import numpy as np
+import re
+import pdfplumber
+import nltk
+from collections import Counter
+from sentence_transformers import SentenceTransformer, util
+import openai
+import itertools
+import logging
 
-# Load environment variables
-load_dotenv()
+# --- CONFIGURATION ---
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
-OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+# OpenAI API key 
+OPENAI_API_KEY = "YOUR_OPENAI_API_KEY"  
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
-class PromptSampler:
-    def __init__(self, sample_size=100, db_path="prompt_responses.csv"):
-        self.api_key = os.getenv("OPENAI_API_KEY")
-        self.sample_size = sample_size
-        self.db_path = db_path
-        self.pickle_path = self.db_path.replace('.csv', '.pkl')
-        
-    def generate_samples(self):
-        """Generate random samples from all possible prompts"""
-        all_prompts = generate_prompts()
-        return random.choices(all_prompts, k=self.sample_size)
-    
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-    def process_prompt(self, prompt_data: dict) -> dict:
-        """Process a single prompt with retry logic using requests"""
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": "gpt-4",
-            "messages": [{"role": "user", "content": prompt_data["prompt"]}],
-            "temperature": 0.7
-        }
-        
+# File paths
+LM_LEXICON_PATH = '/Users/albinbergstrom/Desktop/THESIS CODE/Loughran-McDonald_MasterDictionary_1993-2024.csv'
+PDF_PATH_FINANCE = '/Users/albinbergstrom/Desktop/THESIS CODE/Recent Developments in Finance (2024–2025).pdf'
+PDF_PATH_LEGAL = '/Users/albinbergstrom/Desktop/THESIS CODE/Global Legal Developments (Mid-2024 – Mid-2025).pdf'
+CSV_OUTPUT_PATH = 'Final_dataset_thesis.csv'
+
+# Model configuration
+MODEL_NAME = 'all-mpnet-base-v2'
+BATCH_SIZE = 100
+
+# --- NLTK SETUP ---
+def download_nltk_resources():
+    """Downloads necessary NLTK resources if not already present."""
+    resources_to_download = ['punkt', 'stopwords']
+    for resource in resources_to_download:
         try:
-            print(f"\nSending prompt: {prompt_data['prompt'][:100]}...")
-            response = requests.post(OPENAI_API_URL, headers=headers, json=payload, timeout=60)
-            response.raise_for_status()  # Raise an exception for bad status codes
-            
-            response_data = response.json()
-            
-            print(f"Received response of {response_data['usage']['total_tokens']} tokens")
-            return {
-                **prompt_data,
-                "response": response_data['choices'][0]['message']['content'],
-                "tokens": response_data['usage']['total_tokens'],
-                "success": True,
-                "error": None,
-                "timestamp": datetime.now().isoformat()
-            }
-        except requests.exceptions.RequestException as e:
-            print(f"HTTP Request Error: {str(e)}")
-            error_message = str(e)
-            if e.response is not None:
-                try:
-                    error_details = e.response.json()
-                    error_message += f" - {error_details.get('error', {}).get('message', '')}"
-                except json.JSONDecodeError:
-                    error_message += f" - {e.response.text[:100]}..." # Show start of non-JSON error response
-            return {
-                **prompt_data,
-                "response": "",
-                "tokens": 0,
-                "success": False,
-                "error": f"HTTP Error: {error_message}",
-                "timestamp": datetime.now().isoformat()
-            }
-        except Exception as e:
-            print(f"Error processing prompt: {str(e)}")
-            return {
-                **prompt_data,
-                "response": "",
-                "tokens": 0,
-                "success": False,
-                "error": str(e),
-                "timestamp": datetime.now().isoformat()
-            }
+            nltk.data.find(f'tokenizers/{resource}' if resource == 'punkt' else f'corpora/{resource}')
+            logging.info(f"NLTK resource '{resource}' already downloaded.")
+        except LookupError:
+            logging.info(f"Downloading NLTK resource '{resource}'...")
+            nltk.download(resource, quiet=True)
 
-    def process_samples(self):
-        """Process all samples and save results, appending to existing CSV if present."""
-        samples = self.generate_samples()
-        print(f"\nProcessing {self.sample_size} new samples...")
-        new_results_list = []
-        pbar = tqdm(total=self.sample_size, desc="Processing new samples")
-        
-        for prompt_data in samples:
-            result = self.process_prompt(prompt_data)
-            new_results_list.append(result)
-            pbar.update(1)
-            time.sleep(1)  # Increased delay to be safe with direct API calls
-        
-        pbar.close()
-        new_df = pd.DataFrame(new_results_list)
-        
-        # Define column order once
-        column_order = [
-            'prompt', 'response', 'character_tuning', 'prompter_tuning',
-            'topic', 'prompter_rating', 'tokens', 'success', 'error',
-            'timestamp'
-        ]
+download_nltk_resources()
 
-        # Ensure new_df has all columns in the correct order, even if some are all NaN
-        for col in column_order:
-            if col not in new_df.columns:
-                new_df[col] = None # Or appropriate default like 0 for tokens, False for success
-        new_df = new_df[column_order]
+# --- 1. PROMPT GENERATION ---
+def generate_prompts():
+    """Generate all combinations of prompts based on the independent variables"""
+    logging.info("Generating all prompt combinations...")
+    
+    character_tuning = {
+        "None": "",
+        "Peer": "You are my peer at the company, offering advice based on our similar position",
+        "Mentor": "You are my mentor at this company, offering advice from your more experienced perspective"
+    }
+    
+    prompter_tuning = {
+        "None": "",
+        "Entry-level": "I am an entry-level employee working at a firm within the [Topic] department",
+        "Middle-manager": "I am a middle manager working at a firm within the [Topic] department",
+        "C-suite": "I am a C-suite executive working at a firm within the [Topic] department"
+    }
+    
+    topics = ["Finance", "Legal"]
+    prompter_ratings = list(range(1, 11)) + [None]
+    
+    logging.info(f"Generating {len(character_tuning)} × {len(prompter_tuning)} × {len(topics)} × {len(prompter_ratings)} = {len(character_tuning) * len(prompter_tuning) * len(topics) * len(prompter_ratings)} total prompts")
+    
+    prompts = []
+    for char_name, char_text in character_tuning.items():
+        for prompt_name, prompt_text in prompter_tuning.items():
+            for topic in topics:
+                for rating in prompter_ratings:
+                    components = []
+                    
+                    if char_text:
+                        components.append(f"{char_text};")
+                    
+                    if prompt_text:
+                        components.append(f"{prompt_text.replace('[Topic]', topic)}:")
+                    
+                    components.append(f"What are some interesting things I should know about recent developments/findings within {topic}?")
+                    
+                    if rating is not None:
+                        components.append(f"If I would rate my pre-existing knowledge on this topic on a scale of 1-10, I'd rate myself a {rating}.")
+                    
+                    components.append("Thank you.")
+                    
+                    final_prompt = " ".join(components)
+                    
+                    prompts.append({
+                        "prompt": final_prompt,
+                        "character_tuning": char_name,
+                        "prompter_tuning": prompt_name,
+                        "topic": topic,
+                        "prompter_rating": rating
+                    })
+    
+    df_prompts = pd.DataFrame(prompts)
+    logging.info(f"Generated {len(df_prompts)} prompts successfully")
+    return df_prompts
 
-        # Load existing data if CSV exists and append new results
-        if os.path.exists(self.db_path):
-            print(f"\nLoading existing data from {self.db_path}...")
-            try:
-                existing_df = pd.read_csv(self.db_path)
-                # Ensure existing_df also has all columns in the correct order
-                for col in column_order:
-                    if col not in existing_df.columns:
-                        existing_df[col] = None 
-                existing_df = existing_df[column_order]
-                
-                print(f"Found {len(existing_df)} existing records.")
-                combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-                print(f"Appending {len(new_df)} new records.")
-            except pd.errors.EmptyDataError:
-                print(f"{self.db_path} is empty. Starting with new results.")
-                combined_df = new_df
-            except Exception as e:
-                print(f"Error reading existing CSV {self.db_path}: {e}. Overwriting with new results.")
-                combined_df = new_df # Fallback to overwrite if reading fails badly
-        else:
-            print("No existing CSV found. Creating new file.")
-            combined_df = new_df
-        
-        print("\nSaving combined data...")
-        combined_df.to_csv(self.db_path, index=False)
-        combined_df.to_pickle(self.pickle_path) # Pickle file will always contain the full (combined) dataset
-        
-        print(f"\nResults saved. Total records in {self.db_path}: {len(combined_df)}")
-        print(f"Pickle file updated at {self.pickle_path}")
-        
-        # --- Display summary for the combined_df ---
-        df_to_summarize = combined_df # Use combined_df for summary
-        print("\n--- Overall Summary ---")
-        print(f"Total prompts processed (all runs): {len(df_to_summarize)}")
-        successful_responses_all = df_to_summarize[df_to_summarize['success'] == True]
-        failed_responses_all = df_to_summarize[df_to_summarize['success'] == False]
+# --- 2. LLM RESPONSE COLLECTION ---
+def get_gpt4_response(prompt, temperature=0.7, model="gpt-4"):
+    """Get response from GPT-4 API with error handling"""
+    try:
+        response = openai.ChatCompletion.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_tokens=1024
+        )
+        return response.choices[0].message.content, response.usage.total_tokens, True, None
+    except Exception as e:
+        logging.error(f"Error getting GPT-4 response: {e}")
+        return None, None, False, str(e)
 
-        print(f"Successful responses (all runs): {len(successful_responses_all)}")
-        print(f"Failed responses (all runs): {len(failed_responses_all)}")
+def collect_responses(df_prompts, sample_size=None):
+    """Collect responses from GPT-4 for all prompts"""
+    logging.info("Starting LLM response collection...")
+    
+    if sample_size:
+        df_prompts = df_prompts.head(sample_size)
+        logging.info(f"Using sample size of {sample_size} prompts")
+    
+    responses = []
+    total_prompts = len(df_prompts)
+    
+    for idx, row in df_prompts.iterrows():
+        logging.info(f"Processing prompt {idx + 1}/{total_prompts}")
         
-        avg_tokens = 0
-        if not successful_responses_all.empty:
-            avg_tokens = successful_responses_all['tokens'].mean()
-        print(f"Average tokens per successful response (all runs): {avg_tokens:.2f}")
+        resp, tokens, success, error = get_gpt4_response(row["prompt"])
         
-        print("\nPrompt distribution (all runs):")
-        if not df_to_summarize.empty:
-            print("\nCharacter Tuning distribution:")
-            print(df_to_summarize['character_tuning'].value_counts(dropna=False))
-            print("\nPrompter Tuning distribution:")
-            print(df_to_summarize['prompter_tuning'].value_counts(dropna=False))
-            print("\nTopic distribution:")
-            print(df_to_summarize['topic'].value_counts(dropna=False))
-            
-            # Display first few of the NEWLY ADDED responses for quick check
-            print("\n--- First Few NEWLY ADDED Responses ---")
-            for i, row in new_df.head().iterrows(): # Iterate over new_df for this part
-                print(f"\nPrompt {i+1} from this run (Success: {row['success']}):")
-                print(f"Character Tuning: {row['character_tuning']}")
-                print(f"Prompter Tuning: {row['prompter_tuning']}")
-                print(f"Topic: {row['topic']}")
-                print(f"Rating: {row['prompter_rating']}")
-                print(f"Tokens: {row['tokens']}")
-                if not row['success']:
-                    print(f"Error: {row['error']}")
-                print("-" * 80)
-                print("Prompt:", row['prompt'])
-                print("-" * 80)
-                print("Response:", row['response'])
-                print("=" * 80)
-        else:
-            print("No data to display.")
-            
-        return combined_df # Return the full combined DataFrame
+        responses.append({
+            **row,
+            "response": resp,
+            "tokens": tokens,
+            "success": success,
+            "error": error
+        })
+        
+        # Save progress every 10 prompts
+        if (idx + 1) % 10 == 0:
+            temp_df = pd.DataFrame(responses)
+            temp_df.to_csv("temp_responses.csv", index=False)
+            logging.info(f"Saved progress: {idx + 1}/{total_prompts} responses collected")
+    
+    df_responses = pd.DataFrame(responses)
+    df_responses.to_csv("prompt_responses.csv", index=False)
+    logging.info(f"Response collection complete. Saved {len(df_responses)} responses")
+    return df_responses
 
+# --- 3. LEXICON LOADING & PREPROCESSING ---
+def load_and_filter_lm_lexicon(file_path=LM_LEXICON_PATH):
+    """Loads the Loughran-McDonald lexicon and removes stopwords"""
+    logging.info("Loading Loughran-McDonald lexicon...")
+    
+    try:
+        lm_df = pd.read_csv(file_path, keep_default_na=False, na_values=[''])
+        
+        if 'Word' not in lm_df.columns:
+            logging.error("Error: 'Word' column not found in LM lexicon CSV.")
+            return set()
+        
+        all_lm_words = set(lm_df['Word'].astype(str).str.lower().tolist())
+        logging.info(f"Original LM lexicon size: {len(all_lm_words)} words")
+        
+        stop_words_set = set(nltk.corpus.stopwords.words('english'))
+        lm_words_no_stopwords = {word for word in all_lm_words if word not in stop_words_set}
+        
+        logging.info(f"LM lexicon size after stopword removal: {len(lm_words_no_stopwords)} words")
+        return lm_words_no_stopwords
+        
+    except FileNotFoundError:
+        logging.error(f"Error: LM Lexicon file not found at {file_path}")
+        return set()
+    except Exception as e:
+        logging.error(f"Error processing LM lexicon: {e}")
+        return set()
+
+def preprocess_text(text):
+    """Basic text preprocessing: lowercase, tokenize, remove punctuation"""
+    if not isinstance(text, str):
+        return []
+    text = text.lower()
+    text = re.sub(r'[^\w\s]', '', text)
+    tokens = nltk.word_tokenize(text)
+    return tokens
+
+def count_lexicon_terms(tokens, lexicon_set):
+    """Counts occurrences of terms from the lexicon_set in the given tokens"""
+    if not tokens or not lexicon_set:
+        return 0, []
+    
+    term_counts = Counter(tokens)
+    total_lexicon_matches = 0
+    matched_words_list = []
+    
+    for term in lexicon_set:
+        if term in term_counts:
+            total_lexicon_matches += term_counts[term]
+            matched_words_list.extend([term] * term_counts[term])
+    
+    return total_lexicon_matches, sorted(list(set(matched_words_list)))
+
+def min_max_scale_series(series_to_scale, scale_min=1, scale_max=10):
+    """Applies Min-Max scaling to a pandas Series to a custom range [scale_min, scale_max]"""
+    if series_to_scale.isna().all():
+        return series_to_scale
+    
+    min_val = series_to_scale.min()
+    max_val = series_to_scale.max()
+    
+    if pd.isna(min_val) or pd.isna(max_val):
+        return series_to_scale
+    
+    if max_val == min_val:
+        return pd.Series(np.where(series_to_scale.notna(), scale_min, np.nan), index=series_to_scale.index)
+    
+    scaled_series = scale_min + (series_to_scale - min_val) * (scale_max - scale_min) / (max_val - min_val)
+    return scaled_series
+
+def perform_lexicon_analysis(df_responses):
+    """Perform lexicon-based analysis on responses"""
+    logging.info("Starting lexicon analysis...")
+    
+    # Load lexicon
+    lm_lexicon = load_and_filter_lm_lexicon()
+    if not lm_lexicon:
+        logging.error("Failed to load lexicon. Exiting lexicon analysis.")
+        return df_responses
+    
+    # Preprocess responses
+    df_responses['processed_response_tokens'] = df_responses['response'].apply(preprocess_text)
+    
+    # Count lexicon terms
+    temp_lm_results = df_responses['processed_response_tokens'].apply(
+        lambda tokens: count_lexicon_terms(tokens, lm_lexicon)
+    )
+    
+    df_responses['lm_filtered_finance_term_count'] = temp_lm_results.apply(lambda x: x[0])
+    df_responses['lm_matched_words'] = temp_lm_results.apply(lambda x: ', '.join(x[1]))
+    
+    # Calculate response length
+    df_responses['response_length'] = df_responses['response'].fillna('').astype(str).map(len)
+    
+    # Calculate jargon density
+    df_responses['lm_jargon_density'] = df_responses.apply(
+        lambda row: row['lm_filtered_finance_term_count'] / row['response_length'] 
+        if row['response_length'] > 0 else 0,
+        axis=1
+    )
+    
+    # Scale scores
+    df_responses['lm_jargon_score_scaled'] = min_max_scale_series(df_responses['lm_jargon_density'], 1, 10)
+    df_responses['response_length_scaled'] = min_max_scale_series(df_responses['response_length'], 1, 10)
+    
+    logging.info("Lexicon analysis complete")
+    return df_responses
+
+# --- 4. SEMANTIC SIMILARITY ---
+def extract_text_from_pdf(pdf_path, doc_type="Document"):
+    """Extracts all text from a PDF file"""
+    text = ""
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+        logging.info(f"Successfully extracted text from {doc_type}. Length: {len(text)} characters.")
+        return text
+    except Exception as e:
+        logging.error(f"Error reading PDF for {doc_type}: {e}")
+        return None
+
+def calculate_similarity_bert(text1, text2, model):
+    """Calculates cosine similarity between two texts using a sentence transformer model"""
+    if not text1 or not isinstance(text1, str) or not text1.strip():
+        return None
+    if not text2 or not isinstance(text2, str) or not text2.strip():
+        return None
+    
+    try:
+        embedding1 = model.encode(text1, convert_to_tensor=True)
+        embedding2 = model.encode(text2, convert_to_tensor=True)
+        cosine_scores = util.pytorch_cos_sim(embedding1, embedding2)
+        return cosine_scores.item()
+    except Exception as e:
+        logging.error(f"Error calculating BERT-based similarity: {e}")
+        return None
+
+def perform_semantic_similarity_analysis(df_responses):
+    """Perform semantic similarity analysis"""
+    logging.info("Starting semantic similarity analysis...")
+    
+    # Load sentence transformer model
+    logging.info(f"Loading sentence transformer model: {MODEL_NAME}...")
+    try:
+        model = SentenceTransformer(MODEL_NAME)
+        logging.info(f"Model '{MODEL_NAME}' loaded successfully.")
+    except Exception as e:
+        logging.error(f"Error loading model '{MODEL_NAME}': {e}")
+        return df_responses
+    
+    # Extract benchmark texts
+    logging.info("Extracting benchmark texts...")
+    benchmark_text_finance = extract_text_from_pdf(PDF_PATH_FINANCE, "Finance Benchmark")
+    benchmark_text_legal = extract_text_from_pdf(PDF_PATH_LEGAL, "Legal Benchmark")
+    
+    if not benchmark_text_finance or not benchmark_text_legal:
+        logging.error("Could not extract text from benchmark PDFs. Exiting similarity analysis.")
+        return df_responses
+    
+    # Initialize similarity columns
+    df_responses['finance_benchmark_similarity'] = np.nan
+    df_responses['legal_benchmark_similarity'] = np.nan
+    
+    # Calculate similarities
+    total_responses = len(df_responses)
+    for idx, row in df_responses.iterrows():
+        if (idx + 1) % 10 == 0:
+            logging.info(f"Processing similarity for response {idx + 1}/{total_responses}")
+        
+        llm_response = row['response']
+        topic = row['topic']
+        
+        if pd.isna(llm_response) or not isinstance(llm_response, str) or not llm_response.strip():
+            continue
+        
+        if topic == "Finance":
+            sim = calculate_similarity_bert(llm_response, benchmark_text_finance, model)
+            df_responses.at[idx, 'finance_benchmark_similarity'] = sim
+        elif topic == "Legal":
+            sim = calculate_similarity_bert(llm_response, benchmark_text_legal, model)
+            df_responses.at[idx, 'legal_benchmark_similarity'] = sim
+    
+    # Scale similarity scores
+    logging.info("Scaling similarity scores...")
+    
+    finance_scores = df_responses.loc[df_responses['topic'] == 'Finance', 'finance_benchmark_similarity']
+    legal_scores = df_responses.loc[df_responses['topic'] == 'Legal', 'legal_benchmark_similarity']
+    
+    df_responses.loc[df_responses['topic'] == 'Finance', 'finance_similarity_scaled'] = min_max_scale_series(finance_scores, 1, 10)
+    df_responses.loc[df_responses['topic'] == 'Legal', 'legal_similarity_scaled'] = min_max_scale_series(legal_scores, 1, 10)
+    
+    logging.info("Semantic similarity analysis complete")
+    return df_responses
+
+# --- MAIN PIPELINE ---
 def main():
-    sampler = PromptSampler(sample_size=100) # Change sample_size to 2000 for full run
-    df = sampler.process_samples()
+    """Main pipeline that runs all steps from prompt generation to final dataset"""
+    logging.info("Starting complete pipeline...")
+    
+    # Step 1: Generate prompts
+    df_prompts = generate_prompts()
+    
+    # Step 2: Collect LLM responses (commented out for safety - uncomment to run)
+    # df_responses = collect_responses(df_prompts, sample_size=10)  # Use sample_size for testing
+    
+    # For now, load existing responses if available
+    try:
+        df_responses = pd.read_csv("prompt_responses.csv")
+        logging.info(f"Loaded existing responses from prompt_responses.csv: {len(df_responses)} responses")
+    except FileNotFoundError:
+        logging.info("No existing responses found. Please run collect_responses() first or uncomment the line above.")
+        logging.info("For testing, you can use: df_responses = collect_responses(df_prompts, sample_size=10)")
+        return
+    
+    # Step 3: Perform lexicon analysis
+    df_responses = perform_lexicon_analysis(df_responses)
+    
+    # Step 4: Perform semantic similarity analysis
+    df_responses = perform_semantic_similarity_analysis(df_responses)
+    
+    # Step 5: Remove failed generations
+    if 'success' in df_responses.columns:
+        initial_len = len(df_responses)
+        df_responses = df_responses[df_responses['success'] != False].reset_index(drop=True)
+        removed = initial_len - len(df_responses)
+        logging.info(f"Removed {removed} rows where success == False")
+    
+    # Step 6: Save final dataset
+    df_responses.to_csv(CSV_OUTPUT_PATH, index=False)
+    logging.info(f"Final dataset saved to {CSV_OUTPUT_PATH}")
+    logging.info(f"Final dataset contains {len(df_responses)} rows")
+    
+    # Display sample of results
+    logging.info("Sample of final dataset:")
+    cols_to_show = ['prompt', 'topic', 'response', 'lm_jargon_score_scaled', 'response_length_scaled']
+    if 'finance_similarity_scaled' in df_responses.columns:
+        cols_to_show.append('finance_similarity_scaled')
+    if 'legal_similarity_scaled' in df_responses.columns:
+        cols_to_show.append('legal_similarity_scaled')
+    
+    cols_to_show = [col for col in cols_to_show if col in df_responses.columns]
+    print(df_responses[cols_to_show].head())
 
 if __name__ == "__main__":
-    main()
-
-
-    import pandas as pd
-
-# Load the DataFrame from the pickle file (usually faster and preserves data types)
-try:
-    df = pd.read_pickle("prompt_responses.pkl")
-    print("Loaded data from prompt_responses.pkl")
-except FileNotFoundError:
-    print("prompt_responses.pkl not found, trying CSV...")
-    try:
-        df = pd.read_csv("prompt_responses.csv")
-        print("Loaded data from prompt_responses.csv")
-    except FileNotFoundError:
-        print("Neither prompt_responses.pkl nor prompt_responses.csv found.")
-        df = pd.DataFrame() # Create an empty DataFrame if no file found
-
-if not df.empty:
-    print("\n--- Prompts and Responses ---")
-    for index, row in df.iterrows():
-        print(f"\n--- Entry {index + 1} ---")
-        print(f"Prompt:\n{row['prompt']}\n")
-        print(f"Response:\n{row['response']}\n")
-        print("-" * 30)
-else:
-    print("No data to display.")
-
-print(df)
+    main() 

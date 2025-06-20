@@ -13,7 +13,7 @@ import logging
 # --- CONFIGURATION ---
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
-# Set your OpenAI API key here
+# OpenAI API key 
 OPENAI_API_KEY = "YOUR_OPENAI_API_KEY"  # Replace with your actual API key
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
@@ -353,8 +353,8 @@ def main():
     # Step 1: Generate prompts
     df_prompts = generate_prompts()
     
-    # Step 2: Collect LLM responses (commented out for safety - uncomment to run)
-    # df_responses = collect_responses(df_prompts, sample_size=10)  # Use sample_size for testing
+    # Step 2: Collect LLM responses 
+    df_responses = collect_responses(df_prompts, sample_size=10)  # Use sample_size for testing
     
     # For now, load existing responses if available
     try:
